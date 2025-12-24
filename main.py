@@ -12,17 +12,16 @@ dp = Dispatcher()
 # Простое хранилище задач: {user_id: [("2025-12-24", "14:30", "текст"), ...]}
 user_tasks: dict[int, list[tuple[str, str, str]]] = {}
 
-# Храним имена пользователей и статус "ждём имя"
-user_names: dict[int, str] = {}
-waiting_for_name: set[int] = set()
-
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    """Спрашиваем имя пользователя по-китайски."""
-    user_id = message.from_user.id
-    waiting_for_name.add(user_id)
-    await message.answer("你叫什么名字？")
+    text = (
+        "Привет! Я бот-планировщик.\n\n"
+        "Команды:\n"
+        "пример: /add 14:30 Позвонить маме\n"
+        "/today — показать задачи на сегодня\n"
+    )
+    await message.answer(text)
 
 
 @dp.message(Command("add"))
@@ -33,9 +32,10 @@ async def cmd_add(message: types.Message):
     """
     user_id = message.from_user.id
 
+    # Отрезаем команду и пробел
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        await message.answer("Используй формат: /add HH:MM текст задачи\nНапример: /add 09:00 报名汉语课")
+        await message.answer("Используй формат: /add HH:MM текст задачи\nНапример: /add 09:00 Пойти на тренировку")
         return
 
     time_str = parts[1]
@@ -48,6 +48,7 @@ async def cmd_add(message: types.Message):
         await message.answer("Неверный формат времени. Используй HH:MM, например 09:30")
         return
 
+    # Дата = сегодня
     today_str = date.today().isoformat()  # '2025-12-24'
 
     if user_id not in user_tasks:
@@ -75,26 +76,6 @@ async def cmd_today(message: types.Message):
     lines = [f"{time} — {text}" for time, text in sorted(tasks)]
     text = "Твои задачи на сегодня:\n\n" + "\n".join(lines)
     await message.answer(text)
-
-
-@dp.message()  # обработчик всех остальных сообщений
-async def handle_name_or_default(message: types.Message):
-    """Если ждём имя – запоминаем, иначе игнорируем."""
-    user_id = message.from_user.id
-
-    # Если ждём имя и это не команда (не начинается с '/')
-    if user_id in waiting_for_name and not message.text.startswith("/"):
-        name = message.text.strip()
-        user_names[user_id] = name
-        waiting_for_name.remove(user_id)
-
-        # Ответ по-китайски: "Сунь Шу теперь точно запомнил твоё имя!"
-        await message.answer("孙树已经牢牢记住你的名字了！")
-        return
-
-    # Если не ждём имя — тут можно потом добавить общую обработку,
-    # сейчас просто ничего не делаем.
-    return
 
 
 async def main():
