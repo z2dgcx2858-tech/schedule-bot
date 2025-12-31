@@ -1,152 +1,160 @@
 # database.py
+from __future__ import annotations
+
+import sqlite3
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Tuple, Any
 
-from sqlalchemy import (
-    create_engine, Column, Integer, String,
-    DateTime, Date, Float, Boolean
-)
-from sqlalchemy.orm import declarative_base, sessionmaker
-
-# -------- 1. Подключение к SQLite --------
-# Файл planner.db появится в папке проекта
-DATABASE_URL = "sqlite:///planner.db"
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}  # нужно для SQLite + asyncio
-)
-
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+DB_PATH = "planner.db"
 
 
-# -------- 2. Таблицы (модели) --------
+# ---------- БАЗОВЫЕ ВЕЩИ ----------
 
-class User(Base):
+def get_connection() -> sqlite3.Connection:
     """
-    Пользователь Telegram.
-    tg_id = message.from_user.id
+    Открывает соединение с SQLite.
+    В main.py мы будем делать: `with SessionLocal() as db: ...`
+    поэтому SessionLocal = get_connection.
     """
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    tg_id = Column(Integer, unique=True, index=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-class Task(Base):
-    """
-    Задачи / расписание (то, что сейчас делает /add и /today).
-    """
-    __tablename__ = "tasks"
+# Чтобы main.py не менять, делаем псевдо SessionLocal
+SessionLocal = get_connection
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True, nullable=False)
-
-    date = Column(Date, index=True, nullable=False)     # день задачи
-    start_time = Column(String, nullable=False)         # "14:30"
-    end_time = Column(String, nullable=True)            # можно пока не использовать
-    text = Column(String, nullable=False)
-    category = Column(String, nullable=True)            # "deep_work", "mood" и т.п.
-    done = Column(Boolean, default=False)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class DailyLog(Base):
-    """
-    Ежедневное состояние: настроение, сон, фокус, энергия, стресс.
-    """
-    __tablename__ = "daily_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True, nullable=False)
-
-    date = Column(Date, index=True, nullable=False)
-
-    mood = Column(String, nullable=True)         # "calm", "neutral", "happy" и т.п.
-    sleep_hours = Column(Float, nullable=True)   # 7.5
-    focus_level = Column(String, nullable=True)  # "clear", "foggy"
-    energy = Column(Integer, nullable=True)      # 1–10
-    stress = Column(Integer, nullable=True)      # 1–10
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-# -------- 3. СОЗДАТЬ ТАБЛИЦЫ --------
 
 def init_db() -> None:
     """
-    Вызвать один раз при старте бота.
-    Создаст файл planner.db и таблицы, если их ещё нет.
+    Создаёт таблицы, если их ещё нет.
+    Вызывается один раз при старте бота.
     """
-    Base.metadata.create_all(bind=engine)
+    with get_connection() as conn:
+        cur = conn.cursor()
+
+        # Пользователи
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id INTEGER UNIQUE NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # Задачи
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,           -- YYYY-MM-DD
+                start_time TEXT NOT NULL,     -- '14:30'
+                end_time TEXT,                -- пока не используем
+                text TEXT NOT NULL,
+                category TEXT,
+                done INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+
+        # Ежедневные логи (настроение, сон и т.д.)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,          -- YYYY-MM-DD
+                mood TEXT,
+                sleep_hours REAL,
+                focus_level TEXT,
+                energy INTEGER,
+                stress INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, date),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+
+        conn.commit()
 
 
-# -------- 4. Утилиты для работы с БД --------
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
 
-def get_or_create_user(db, tg_id: int) -> User:
+def _get_or_create_user(conn: sqlite3.Connection, tg_id: int) -> int:
     """
-    Найти пользователя по tg_id, если нет — создать.
+    Возвращает внутренний id пользователя по tg_id.
+    Если пользователя нет — создаёт.
     """
-    user = db.query(User).filter(User.tg_id == tg_id).first()
-    if user:
-        return user
-    user = User(tg_id=tg_id)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
+    row = cur.fetchone()
+    if row:
+        return row["id"]
+
+    now = datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO users (tg_id, created_at) VALUES (?, ?)",
+        (tg_id, now),
+    )
+    conn.commit()
+    return cur.lastrowid
 
 
-# === Работа с задачами ===
+# ---------- ЗАДАЧИ ----------
 
 def add_task(
-    db,
+    conn: sqlite3.Connection,
     tg_id: int,
     date_obj: date,
     time_str: str,
     text: str,
-    category: Optional[str] = None
-) -> Task:
-    """
-    Добавить задачу пользователю.
-    """
-    user = get_or_create_user(db, tg_id=tg_id)
-
-    task = Task(
-        user_id=user.id,
-        date=date_obj,
-        start_time=time_str,
-        text=text,
-        category=category,
+    category: Optional[str] = None,
+) -> None:
+    user_id = _get_or_create_user(conn, tg_id)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO tasks (user_id, date, start_time, text, category, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, date_obj.isoformat(), time_str, text, category, datetime.utcnow().isoformat()),
     )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    return task
+    conn.commit()
 
 
-def get_tasks_for_date(db, tg_id: int, date_obj: date) -> List[Task]:
+def get_tasks_for_date(
+    conn: sqlite3.Connection,
+    tg_id: int,
+    date_obj: date,
+) -> List[Tuple[str, str]]:
     """
-    Получить задачи пользователя на конкретную дату.
+    Возвращает список задач (time_str, text) на указанную дату.
     """
-    user = get_or_create_user(db, tg_id=tg_id)
-
-    tasks = (
-        db.query(Task)
-        .filter(Task.user_id == user.id, Task.date == date_obj)
-        .order_by(Task.start_time.asc())
-        .all()
+    user_id = _get_or_create_user(conn, tg_id)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT start_time, text
+        FROM tasks
+        WHERE user_id = ? AND date = ?
+        ORDER BY start_time ASC
+        """,
+        (user_id, date_obj.isoformat()),
     )
-    return tasks
+    rows = cur.fetchall()
+    return [(row["start_time"], row["text"]) for row in rows]
 
 
-# === Работа с дневником состояния ===
+# ---------- ДНЕВНИК СОСТОЯНИЯ ----------
 
 def upsert_daily_log(
-    db,
+    conn: sqlite3.Connection,
     tg_id: int,
     date_obj: date,
     mood: Optional[str] = None,
@@ -154,47 +162,86 @@ def upsert_daily_log(
     focus_level: Optional[str] = None,
     energy: Optional[int] = None,
     stress: Optional[int] = None,
-) -> DailyLog:
+) -> None:
     """
-    Создать или обновить запись о состоянии за день.
+    Создаёт или обновляет запись за день.
     """
-    user = get_or_create_user(db, tg_id=tg_id)
+    user_id = _get_or_create_user(conn, tg_id)
+    cur = conn.cursor()
 
-    log = (
-        db.query(DailyLog)
-        .filter(DailyLog.user_id == user.id, DailyLog.date == date_obj)
-        .first()
+    cur.execute(
+        "SELECT id FROM daily_logs WHERE user_id = ? AND date = ?",
+        (user_id, date_obj.isoformat()),
     )
+    row = cur.fetchone()
 
-    if not log:
-        log = DailyLog(user_id=user.id, date=date_obj)
+    now = datetime.utcnow().isoformat()
 
-    if mood is not None:
-        log.mood = mood
-    if sleep_hours is not None:
-        log.sleep_hours = sleep_hours
-    if focus_level is not None:
-        log.focus_level = focus_level
-    if energy is not None:
-        log.energy = energy
-    if stress is not None:
-        log.stress = stress
+    if row is None:
+        # создаём новую запись
+        cur.execute(
+            """
+            INSERT INTO daily_logs
+            (user_id, date, mood, sleep_hours, focus_level, energy, stress, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                date_obj.isoformat(),
+                mood,
+                sleep_hours,
+                focus_level,
+                energy,
+                stress,
+                now,
+            ),
+        )
+    else:
+        # обновляем существующую
+        updates = []
+        params: list[Any] = []
 
-    db.add(log)
-    db.commit()
-    db.refresh(log)
-    return log
+        if mood is not None:
+            updates.append("mood = ?")
+            params.append(mood)
+        if sleep_hours is not None:
+            updates.append("sleep_hours = ?")
+            params.append(sleep_hours)
+        if focus_level is not None:
+            updates.append("focus_level = ?")
+            params.append(focus_level)
+        if energy is not None:
+            updates.append("energy = ?")
+            params.append(energy)
+        if stress is not None:
+            updates.append("stress = ?")
+            params.append(stress)
+
+        if updates:
+            sql = f"UPDATE daily_logs SET {', '.join(updates)} WHERE user_id = ? AND date = ?"
+            params.extend([user_id, date_obj.isoformat()])
+            cur.execute(sql, tuple(params))
+
+    conn.commit()
 
 
-def get_daily_log(db, tg_id: int, date_obj: date) -> Optional[DailyLog]:
+def get_daily_log(
+    conn: sqlite3.Connection,
+    tg_id: int,
+    date_obj: date,
+) -> Optional[sqlite3.Row]:
     """
-    Получить дневную запись пользователя за конкретный день.
+    Возвращает одну запись дневника за день или None.
     """
-    user = get_or_create_user(db, tg_id=tg_id)
-
-    log = (
-        db.query(DailyLog)
-        .filter(DailyLog.user_id == user.id, DailyLog.date == date_obj)
-        .first()
+    user_id = _get_or_create_user(conn, tg_id)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM daily_logs
+        WHERE user_id = ? AND date = ?
+        """,
+        (user_id, date_obj.isoformat()),
     )
-    return log
+    row = cur.fetchone()
+    return row
