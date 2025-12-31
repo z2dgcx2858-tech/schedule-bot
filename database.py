@@ -3,9 +3,28 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, date
-from typing import Optional, List, Tuple, Any
+from dataclasses import dataclass
+from typing import Optional, List, Any
+
 
 DB_PATH = "planner.db"
+
+
+# ---------- DTO-КЛАССЫ (чтобы main.py мог обращаться к .start_time, .text и т.д.) ----------
+
+@dataclass
+class TaskDTO:
+    start_time: str
+    text: str
+
+
+@dataclass
+class DailyLogDTO:
+    mood: Optional[str]
+    sleep_hours: Optional[float]
+    focus_level: Optional[str]
+    energy: Optional[int]
+    stress: Optional[int]
 
 
 # ---------- БАЗОВЫЕ ВЕЩИ ----------
@@ -13,7 +32,7 @@ DB_PATH = "planner.db"
 def get_connection() -> sqlite3.Connection:
     """
     Открывает соединение с SQLite.
-    В main.py мы будем делать: `with SessionLocal() as db: ...`
+    В main.py мы будем делать: `with SessionLocal() as db: ...`,
     поэтому SessionLocal = get_connection.
     """
     conn = sqlite3.connect(DB_PATH)
@@ -116,6 +135,9 @@ def add_task(
     text: str,
     category: Optional[str] = None,
 ) -> None:
+    """
+    Добавляет задачу пользователю на указанную дату и время.
+    """
     user_id = _get_or_create_user(conn, tg_id)
     cur = conn.cursor()
     cur.execute(
@@ -132,9 +154,10 @@ def get_tasks_for_date(
     conn: sqlite3.Connection,
     tg_id: int,
     date_obj: date,
-) -> List[Tuple[str, str]]:
+) -> List[TaskDTO]:
     """
-    Возвращает список задач (time_str, text) на указанную дату.
+    Возвращает список задач на указанную дату как объекты TaskDTO
+    с полями .start_time и .text (под main.py).
     """
     user_id = _get_or_create_user(conn, tg_id)
     cur = conn.cursor()
@@ -148,7 +171,7 @@ def get_tasks_for_date(
         (user_id, date_obj.isoformat()),
     )
     rows = cur.fetchall()
-    return [(row["start_time"], row["text"]) for row in rows]
+    return [TaskDTO(start_time=row["start_time"], text=row["text"]) for row in rows]
 
 
 # ---------- ДНЕВНИК СОСТОЯНИЯ ----------
@@ -165,6 +188,7 @@ def upsert_daily_log(
 ) -> None:
     """
     Создаёт или обновляет запись за день.
+    Любой параметр, который не None, будет записан/обновлён.
     """
     user_id = _get_or_create_user(conn, tg_id)
     cur = conn.cursor()
@@ -229,19 +253,30 @@ def get_daily_log(
     conn: sqlite3.Connection,
     tg_id: int,
     date_obj: date,
-) -> Optional[sqlite3.Row]:
+) -> Optional[DailyLogDTO]:
     """
-    Возвращает одну запись дневника за день или None.
+    Возвращает одну запись дневника за день как DailyLogDTO
+    с полями .mood, .sleep_hours, .focus_level, .energy, .stress,
+    либо None, если записи нет.
     """
     user_id = _get_or_create_user(conn, tg_id)
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT *
+        SELECT mood, sleep_hours, focus_level, energy, stress
         FROM daily_logs
         WHERE user_id = ? AND date = ?
         """,
         (user_id, date_obj.isoformat()),
     )
     row = cur.fetchone()
-    return row
+    if row is None:
+        return None
+
+    return DailyLogDTO(
+        mood=row["mood"],
+        sleep_hours=row["sleep_hours"],
+        focus_level=row["focus_level"],
+        energy=row["energy"],
+        stress=row["stress"],
+    )
