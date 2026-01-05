@@ -1,200 +1,268 @@
 # database.py
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String,
-    DateTime, Date, Float, Boolean
+    create_engine,
+    String,
+    Integer,
+    Date,
+    DateTime,
+    Boolean,
+    ForeignKey,
+    Text,
+    UniqueConstraint,
+    select,
+    delete,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 
-# -------- 1. Подключение к SQLite --------
-# Файл planner.db появится в папке проекта
-DATABASE_URL = "sqlite:///planner.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}  # нужно для SQLite + asyncio
-)
+# Railway часто даёт postgres:// вместо postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
 
 
-# -------- 2. Таблицы (модели) --------
+class Base(DeclarativeBase):
+    pass
+
 
 class User(Base):
-    """
-    Пользователь Telegram.
-    tg_id = message.from_user.id
-    """
     __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    tg_id = Column(Integer, unique=True, index=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tg_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class Task(Base):
-    """
-    Задачи / расписание (то, что сейчас делает /add и /today).
-    """
     __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True, nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)  # HH:MM (фикс)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
 
-    date = Column(Date, index=True, nullable=False)     # день задачи
-    start_time = Column(String, nullable=False)         # "14:30"
-    end_time = Column(String, nullable=True)            # можно пока не использовать
-    text = Column(String, nullable=False)
-    category = Column(String, nullable=True)            # "deep_work", "mood" и т.п.
-    done = Column(Boolean, default=False)
+    done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # для этапа 1: длительность (если нет — будем считать 30)
+    estimated_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
 
-
-class DailyLog(Base):
-    """
-    Ежедневное состояние: настроение, сон, фокус, энергия, стресс.
-    """
-    __tablename__ = "daily_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True, nullable=False)
-
-    date = Column(Date, index=True, nullable=False)
-
-    mood = Column(String, nullable=True)         # "calm", "neutral", "happy" и т.п.
-    sleep_hours = Column(Float, nullable=True)   # 7.5
-    focus_level = Column(String, nullable=True)  # "clear", "foggy"
-    energy = Column(Integer, nullable=True)      # 1–10
-    stress = Column(Integer, nullable=True)      # 1–10
-
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
-# -------- 3. СОЗДАТЬ ТАБЛИЦЫ --------
+class Availability(Base):
+    __tablename__ = "availability"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)  # HH:MM
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)    # HH:MM
+    __table_args__ = (UniqueConstraint("user_id", "date", name="uq_availability_user_date"),)
+
+
+class BusyBlock(Base):
+    __tablename__ = "busy_blocks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Plan(Base):
+    __tablename__ = "plans"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    items: Mapped[List["PlanItem"]] = relationship(back_populates="plan", cascade="all, delete-orphan")
+
+    __table_args__ = (UniqueConstraint("user_id", "date", name="uq_plan_user_date"),)
+
+
+class PlanItem(Base):
+    __tablename__ = "plan_items"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"), nullable=False)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=False)
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+
+    plan: Mapped[Plan] = relationship(back_populates="items")
+
+
+@dataclass
+class TaskDTO:
+    id: int
+    start_time: Optional[str]
+    text: str
+    done: bool
+    estimated_minutes: int
+
 
 def init_db() -> None:
-    """
-    Вызвать один раз при старте бота.
-    Создаст файл planner.db и таблицы, если их ещё нет.
-    """
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(engine)
 
 
-# -------- 4. Утилиты для работы с БД --------
-
-def get_or_create_user(db, tg_id: int) -> User:
-    """
-    Найти пользователя по tg_id, если нет — создать.
-    """
-    user = db.query(User).filter(User.tg_id == tg_id).first()
-    if user:
-        return user
-    user = User(tg_id=tg_id)
-    db.add(user)
+def _get_or_create_user_id(db: Session, tg_id: int) -> int:
+    u = db.execute(select(User).where(User.tg_id == tg_id)).scalar_one_or_none()
+    if u:
+        return u.id
+    u = User(tg_id=tg_id)
+    db.add(u)
     db.commit()
-    db.refresh(user)
-    return user
+    db.refresh(u)
+    return u.id
 
 
-# === Работа с задачами ===
-
-def add_task(
-    db,
-    tg_id: int,
-    date_obj: date,
-    time_str: str,
-    text: str,
-    category: Optional[str] = None
-) -> Task:
-    """
-    Добавить задачу пользователю.
-    """
-    user = get_or_create_user(db, tg_id=tg_id)
-
-    task = Task(
-        user_id=user.id,
-        date=date_obj,
-        start_time=time_str,
-        text=text,
-        category=category,
-    )
-    db.add(task)
+# ---------- tasks ----------
+def add_task(db: Session, tg_id: int, date_obj: date, time_str: Optional[str], text: str, minutes: int = 30) -> None:
+    user_id = _get_or_create_user_id(db, tg_id)
+    t = Task(user_id=user_id, date=date_obj, start_time=time_str, text=text, estimated_minutes=minutes)
+    db.add(t)
     db.commit()
-    db.refresh(task)
-    return task
 
 
-def get_tasks_for_date(db, tg_id: int, date_obj: date) -> List[Task]:
-    """
-    Получить задачи пользователя на конкретную дату.
-    """
-    user = get_or_create_user(db, tg_id=tg_id)
-
-    tasks = (
-        db.query(Task)
-        .filter(Task.user_id == user.id, Task.date == date_obj)
-        .order_by(Task.start_time.asc())
-        .all()
-    )
-    return tasks
+def get_tasks_for_date(db: Session, tg_id: int, date_obj: date) -> List[TaskDTO]:
+    user_id = _get_or_create_user_id(db, tg_id)
+    rows = db.execute(
+        select(Task).where(Task.user_id == user_id, Task.date == date_obj).order_by(Task.start_time.is_(None), Task.start_time.asc())
+    ).scalars().all()
+    return [
+        TaskDTO(id=r.id, start_time=r.start_time, text=r.text, done=r.done, estimated_minutes=r.estimated_minutes)
+        for r in rows
+    ]
 
 
-# === Работа с дневником состояния ===
+def get_todo_tasks_for_date(db: Session, tg_id: int, date_obj: date) -> List[Task]:
+    user_id = _get_or_create_user_id(db, tg_id)
+    return db.execute(
+        select(Task).where(Task.user_id == user_id, Task.date == date_obj, Task.done.is_(False))
+    ).scalars().all()
 
-def upsert_daily_log(
-    db,
-    tg_id: int,
-    date_obj: date,
-    mood: Optional[str] = None,
-    sleep_hours: Optional[float] = None,
-    focus_level: Optional[str] = None,
-    energy: Optional[int] = None,
-    stress: Optional[int] = None,
-) -> DailyLog:
-    """
-    Создать или обновить запись о состоянии за день.
-    """
-    user = get_or_create_user(db, tg_id=tg_id)
 
-    log = (
-        db.query(DailyLog)
-        .filter(DailyLog.user_id == user.id, DailyLog.date == date_obj)
-        .first()
-    )
-
-    if not log:
-        log = DailyLog(user_id=user.id, date=date_obj)
-
-    if mood is not None:
-        log.mood = mood
-    if sleep_hours is not None:
-        log.sleep_hours = sleep_hours
-    if focus_level is not None:
-        log.focus_level = focus_level
-    if energy is not None:
-        log.energy = energy
-    if stress is not None:
-        log.stress = stress
-
-    db.add(log)
+def set_task_done(db: Session, tg_id: int, task_id: int, done: bool) -> bool:
+    user_id = _get_or_create_user_id(db, tg_id)
+    t = db.execute(select(Task).where(Task.id == task_id, Task.user_id == user_id)).scalar_one_or_none()
+    if not t:
+        return False
+    t.done = done
     db.commit()
-    db.refresh(log)
-    return log
+    return True
 
 
-def get_daily_log(db, tg_id: int, date_obj: date) -> Optional[DailyLog]:
+# ---------- availability / busy ----------
+def set_availability(db: Session, tg_id: int, date_obj: date, start_hhmm: str, end_hhmm: str) -> None:
+    user_id = _get_or_create_user_id(db, tg_id)
+    row = db.execute(select(Availability).where(Availability.user_id == user_id, Availability.date == date_obj)).scalar_one_or_none()
+    if row:
+        row.start_time = start_hhmm
+        row.end_time = end_hhmm
+    else:
+        db.add(Availability(user_id=user_id, date=date_obj, start_time=start_hhmm, end_time=end_hhmm))
+    db.commit()
+
+
+def add_busy(db: Session, tg_id: int, date_obj: date, start_hhmm: str, end_hhmm: str) -> None:
+    user_id = _get_or_create_user_id(db, tg_id)
+    db.add(BusyBlock(user_id=user_id, date=date_obj, start_time=start_hhmm, end_time=end_hhmm))
+    db.commit()
+
+
+def get_availability_and_busy(db: Session, tg_id: int, date_obj: date) -> Tuple[Tuple[str, str], List[Tuple[str, str]]]:
+    user_id = _get_or_create_user_id(db, tg_id)
+
+    av = db.execute(select(Availability).where(Availability.user_id == user_id, Availability.date == date_obj)).scalar_one_or_none()
+    if av:
+        avail = (av.start_time, av.end_time)
+    else:
+        avail = ("09:00", "21:00")  # дефолт
+
+    busy_rows = db.execute(
+        select(BusyBlock).where(BusyBlock.user_id == user_id, BusyBlock.date == date_obj).order_by(BusyBlock.start_time.asc())
+    ).scalars().all()
+    busy = [(b.start_time, b.end_time) for b in busy_rows]
+
+    return avail, busy
+
+
+# ---------- plan ----------
+def generate_plan(db: Session, tg_id: int, date_obj: date) -> Tuple[int, List[int]]:
     """
-    Получить дневную запись пользователя за конкретный день.
+    Этап 1:
+      - берём TODO задачи
+      - берём availability и busy
+      - строим простой план
+      - сохраняем в plans/plan_items
+    Возвращает:
+      plan_id, not_scheduled_task_ids
     """
-    user = get_or_create_user(db, tg_id=tg_id)
+    from ai_engine import TaskIn, build_plan
 
-    log = (
-        db.query(DailyLog)
-        .filter(DailyLog.user_id == user.id, DailyLog.date == date_obj)
-        .first()
-    )
-    return log
+    user_id = _get_or_create_user_id(db, tg_id)
+
+    # удалить старый план на эту дату (чтобы /plan_generate пересчитывал)
+    old = db.execute(select(Plan).where(Plan.user_id == user_id, Plan.date == date_obj)).scalar_one_or_none()
+    if old:
+        db.execute(delete(Plan).where(Plan.id == old.id))
+        db.commit()
+
+    plan = Plan(user_id=user_id, date=date_obj)
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+
+    avail, busy = get_availability_and_busy(db, tg_id, date_obj)
+
+    tasks = get_todo_tasks_for_date(db, tg_id, date_obj)
+    tasks_in = [
+        TaskIn(
+            id=t.id,
+            text=t.text,
+            duration_min=t.estimated_minutes or 30,
+            fixed_start_hhmm=t.start_time,
+        )
+        for t in tasks
+    ]
+
+    items, not_scheduled = build_plan(tasks_in, avail, busy)
+
+    for it in items:
+        db.add(PlanItem(plan_id=plan.id, task_id=it.task_id, start_time=it.start_hhmm, end_time=it.end_hhmm))
+
+    db.commit()
+    return plan.id, not_scheduled
+
+
+def get_plan(db: Session, tg_id: int, date_obj: date) -> Optional[Tuple[int, List[Tuple[str, str, int, str]]]]:
+    """
+    Возвращает:
+      (plan_id, [(start, end, task_id, task_text), ...])
+    """
+    user_id = _get_or_create_user_id(db, tg_id)
+    p = db.execute(select(Plan).where(Plan.user_id == user_id, Plan.date == date_obj)).scalar_one_or_none()
+    if not p:
+        return None
+
+    rows = db.execute(
+        select(PlanItem.start_time, PlanItem.end_time, Task.id, Task.text)
+        .join(Task, Task.id == PlanItem.task_id)
+        .where(PlanItem.plan_id == p.id)
+        .order_by(PlanItem.start_time.asc())
+    ).all()
+
+    items = [(r[0], r[1], r[2], r[3]) for r in rows]
+    return p.id, items
